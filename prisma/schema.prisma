@@ -1,0 +1,32 @@
+generator client {
+    provider      = "prisma-client-js"
+    output        = "./client"
+    binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-arm64-openssl-3.0.x"]
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+model Conversation {
+    id       String                @id @default(cuid())
+    userId   String?
+    messages ConversationMessage[]
+    archived Boolean?
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
+
+model ConversationMessage {
+    id             String       @id @default(cuid())
+    conversationId String
+    conversation   Conversation @relation(fields: [conversationId], references: [id])
+    messageText    String
+    role           String
+    sequenceNumber Int
+
+    createdAt DateTime @default(now())
+    updatedAt DateTime @updatedAt
+}
