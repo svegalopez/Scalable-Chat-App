@@ -15,6 +15,30 @@ const minioClient = new Minio.Client({
   secretKey: "minioadmin",
 });
 
+class BatchStream extends Transform {
+  constructor(batchSize) {
+    super({ objectMode: true });
+    this.batchSize = batchSize;
+    this.batch = [];
+  }
+
+  _transform(chunk, encoding, callback) {
+    this.batch.push(chunk);
+    if (this.batch.length >= this.batchSize) {
+      this.push(this.batch);
+      this.batch = [];
+    }
+    callback();
+  }
+
+  _flush(callback) {
+    if (this.batch.length > 0) {
+      this.push(this.batch);
+    }
+    callback();
+  }
+}
+
 class Parser extends Transform {
   constructor() {
     super({
@@ -197,6 +221,7 @@ router.post("/chat", async (req, res) => {
   }
 });
 
+const MAX_RETRIES = 3;
 router.get("/conversation/:id/messages", async (req, res) => {
   try {
     const conversationId = req.params.id;
@@ -221,46 +246,88 @@ router.get("/conversation/:id/messages", async (req, res) => {
     const bucketName = "conversation-message-archives";
     const objectName = `${conversationId}_messages`;
 
-    const stream = await minioClient.getObject(bucketName, objectName);
-    const parser = new Parser();
-    let first = true;
-    const saveMessagesStream = new Writable({
-      objectMode: true,
-      async write(message, encoding, callback) {
-        try {
-          await prisma.conversationMessage.create({
-            data: message,
-          });
-          if (first) {
-            res.write(JSON.stringify(message));
-          } else {
-            res.write(`,${JSON.stringify(message)}`);
+    await prisma.$transaction(async (tx) => {
+      const stream = await minioClient.getObject(bucketName, objectName);
+      const parser = new Parser();
+      const batchStream = new BatchStream(2);
+      let first = true;
+
+      const saveMessagesStream = new Writable({
+        objectMode: true,
+        async write(messages, encoding, callback) {
+          try {
+            await tx.conversationMessage.createMany({
+              data: messages, // messages is an array of messages (batch)
+              skipDuplicates: true,
+            });
+
+            // Write the message to the http response
+            if (first) {
+              let str = "";
+              for (let i = 0; i < messages.length; i++) {
+                str += JSON.stringify(messages[i]);
+                if (i < messages.length - 1) {
+                  str += ",";
+                }
+              }
+              res.write(str);
+            } else {
+              let str = ",";
+              for (let i = 0; i < messages.length; i++) {
+                str += JSON.stringify(messages[i]);
+                if (i < messages.length - 1) {
+                  str += ",";
+                }
+              }
+              res.write(str);
+            }
+            first = false;
+            callback();
+          } catch (err) {
+            callback(err);
           }
-          first = false;
-          callback();
+        },
+      });
+
+      // Write headers for letting the client know im sending json
+      res.setHeader("Content-Type", "application/json");
+      // Write the opening bracket
+      res.write("[");
+
+      // Stream the data from Minio, split by new line, parse into JSON, and save to the database while sending to the client
+      await pipelineAsync(
+        stream,
+        es.split(),
+        parser,
+        batchStream,
+        saveMessagesStream
+      );
+
+      // Update the conversation to mark it as unarchived: retry if it fails, but do not rollback the transaction
+      let retries = 0;
+      while (retries < MAX_RETRIES) {
+        try {
+          await tx.conversation.update({
+            where: { id: conversationId },
+            data: { archived: false },
+          });
+          break; // exit the loop if the update is successful
         } catch (err) {
-          callback(err);
+          retries++;
+          if (retries >= MAX_RETRIES) {
+            console.error(
+              `Failed to update conversation ${conversationId} after ${MAX_RETRIES} retries. Error: ${err}`
+            );
+            break; // exit the loop and continue with the transaction
+          }
+          // wait for a short period of time before retrying
+          await new Promise((resolve) => setTimeout(resolve, 250 * retries));
         }
-      },
+      }
+      // Remove the trailing comma
+      res.write("]");
+      res.end();
     });
-
-    // Write headers for letting the client know im sending json
-    res.setHeader("Content-Type", "application/json");
-    // Write the opening bracket
-    res.write("[");
-
-    // Stream the data from Minio, split by new line, parse into JSON, and save to the database while sending to the client
-    await pipelineAsync(stream, es.split(), parser, saveMessagesStream);
-
-    // Update the conversation to mark it as unarchived
-    await prisma.conversation.update({
-      where: { id: conversationId },
-      data: { archived: false },
-    });
-
-    // Remove the trailing comma
-    res.write("]");
-    res.end();
   } catch (err) {
     console.error(err);
 
@@ -270,7 +337,7 @@ router.get("/conversation/:id/messages", async (req, res) => {
         .status(err.status || 500)
         .json({ error: err.msg || "An error occurred" });
     } else {
-      res.setHeader("ise-message", err.msg || "An error occurred");
+      res.write("An error occurred");
       res.end();
     }
   }
