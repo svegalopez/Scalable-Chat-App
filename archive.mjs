@@ -3,6 +3,7 @@ import { Readable } from "stream";
 import { Transform } from "stream";
 import * as Minio from "minio";
 import yargs from "yargs";
+import createBucketIfNotExists from "./utils/createBucket.js";
 
 const prisma = new PrismaClient();
 
@@ -43,21 +44,7 @@ async function main() {
   archivalThreshold = parseInt(archivalThreshold.split(" ")[0]);
 
   const bucketName = "conversation-message-archives";
-  const bucketExists = new Promise((resolve, reject) => {
-    minioClient.bucketExists(bucketName, function (err, exists) {
-      if (err) reject(err);
-      if (!exists) {
-        minioClient.makeBucket(bucketName, function (err) {
-          if (err) reject(err);
-          resolve();
-        });
-      } else {
-        resolve();
-      }
-    });
-  });
-  // Wait for the bucket to be created or confirmed
-  await bucketExists;
+  await createBucketIfNotExists(minioClient, bucketName);
 
   // 1. Fetch conversation IDs updated over n months ago
   const dateThreshold = new Date();

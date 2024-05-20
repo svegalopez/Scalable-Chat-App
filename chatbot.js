@@ -4,8 +4,9 @@ const { openai, prisma } = require("./clients");
 const { verify, sign } = require("jsonwebtoken");
 const Minio = require("minio");
 const es = require("event-stream");
-const { Transform, Writable, pipeline } = require("stream");
+const { Readable, Transform, Writable, pipeline } = require("stream");
 const pipelineAsync = require("util").promisify(pipeline);
+const ensureBucketExists = require("./utils/createBucket");
 
 const minioClient = new Minio.Client({
   endPoint: "minio",
@@ -62,6 +63,44 @@ class Parser extends Transform {
       console.error(err);
       callback(err);
     }
+  }
+}
+
+class HtmlBuilder extends Transform {
+  constructor() {
+    super({
+      writableObjectMode: true,
+      readableObjectMode: false,
+    });
+    this.headerWritten = false;
+  }
+
+  _transform(message, encoding, callback) {
+    if (!this.headerWritten) {
+      this.push(
+        `<!DOCTYPE html><html><head><title>Conversation Export</title></head><body>`
+      );
+      this.push(`<h1>Conversation Export</h1>`);
+      this.push(`<ul>`);
+      this.headerWritten = true;
+    }
+
+    this.push(`<li><p>${message.messageText}</p></li>`);
+    callback();
+  }
+
+  _flush(callback) {
+    if (this.headerWritten) {
+      this.push(`</ul></body></html>`);
+    } else {
+      this.push(
+        `<!DOCTYPE html><html><head><title>Conversation Export</title></head><body>`
+      );
+      this.push(`<h1>Conversation Export</h1>`);
+      this.push(`<p>No messages found</p>`);
+      this.push(`</body></html>`);
+    }
+    callback();
   }
 }
 
@@ -340,6 +379,69 @@ router.get("/conversation/:id/messages", async (req, res) => {
       res.write("An error occurred");
       res.end();
     }
+  }
+});
+
+router.post("/conversation/:id/export", async (req, res) => {
+  try {
+    const threadId = req.params.id;
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: threadId },
+    });
+
+    if (!conversation) {
+      return res.status(404).json({ error: "Conversation not found" });
+    }
+
+    // Create a readable stream for messages within the conversation
+    let cursor;
+    const readableStream = new Readable({
+      objectMode: true,
+      async read() {
+        try {
+          // Fetch a batch of messages for the current conversation
+          const messages = await prisma.conversationMessage.findMany({
+            where: { conversationId: threadId },
+            take: 2, // adjust the batch size as needed
+            skip: cursor ? 1 : 0,
+            cursor: cursor ? { id: cursor } : undefined, // Use message ID as cursor
+          });
+
+          for (const message of messages) {
+            this.push(message); // Push each message to the stream
+          }
+
+          if (messages.length < 2) {
+            this.push(null); // Signal end of messages for this conversation
+          } else {
+            cursor = messages[messages.length - 1].id; // Update the cursor
+          }
+        } catch (err) {
+          this.destroy(err);
+        }
+      },
+    });
+
+    // Create an HTML builder transform stream
+    const htmlBuilder = new HtmlBuilder();
+    readableStream.pipe(htmlBuilder);
+
+    // Upload the static website to Minio
+    const bucketName = "conversation-exports";
+    const objectName = `${threadId}_export.html`;
+    const metaData = {
+      "Content-Type": "text/html",
+    };
+
+    await ensureBucketExists(minioClient, bucketName);
+    await minioClient.putObject(bucketName, objectName, htmlBuilder, metaData);
+
+    return res.json({ message: "Conversation exported successfully" });
+  } catch (error) {
+    console.log(error);
+    res
+      .status(error.status || 500)
+      .send(error.msg || "An error occurred while exporting the conversation");
   }
 });
 
