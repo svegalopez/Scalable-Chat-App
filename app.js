@@ -20,6 +20,11 @@ app.use(express.json());
 
 app.use(require("./chatbot"));
 
+// Add a 404 route
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
 app.listen(3089, () => {
   console.log("Server is running on port 3089");
 });
